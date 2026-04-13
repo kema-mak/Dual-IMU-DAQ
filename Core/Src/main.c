@@ -22,7 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
+#include "mpu9250.h"
+#include "ring_buffer.h"
+#include "sd_logger.h"
+#include "timestamp.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +55,16 @@ DMA_HandleTypeDef hdma_spi4_tx;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+static mpu9250_dev_t imu1 = { .cs_port = CS_IMU1_GPIO_Port, .cs_pin = CS_IMU1_Pin };
+static mpu9250_dev_t imu2 = { .cs_port = CS_IMU2_GPIO_Port, .cs_pin = CS_IMU2_Pin };
+static uint8_t imu1_rx_frame[15] __attribute__((aligned(4)));
+static uint8_t imu2_rx_frame[15] __attribute__((aligned(4)));
+static uint8_t imu1_raw[14] __attribute__((aligned(4)));
+static uint8_t imu2_raw[14] __attribute__((aligned(4)));
+static volatile uint32_t imu_timestamp_us;
 
+typedef enum { IMU_DMA_IDLE = 0, IMU_DMA_IMU1, IMU_DMA_IMU2 } imu_dma_state_t;
+static volatile imu_dma_state_t imu_dma_state = IMU_DMA_IDLE;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,12 +75,27 @@ static void MX_SPI4_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void Record_BuildAndPush(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Record_BuildAndPush(void)
+{
+  uint8_t record[RECORD_SIZE_BYTES];
 
+  MPU9250_ExtractBurst14(imu1_rx_frame, imu1_raw);
+  MPU9250_ExtractBurst14(imu2_rx_frame, imu2_raw);
+
+  record[0] = (uint8_t)(imu_timestamp_us & 0xFFU);
+  record[1] = (uint8_t)((imu_timestamp_us >> 8) & 0xFFU);
+  record[2] = (uint8_t)((imu_timestamp_us >> 16) & 0xFFU);
+  record[3] = (uint8_t)((imu_timestamp_us >> 24) & 0xFFU);
+  (void)memcpy(&record[4], imu1_raw, 14U);
+  (void)memcpy(&record[18], imu2_raw, 14U);
+
+  (void)RingBuffer_PushRecord_ISR(record);
+}
 /* USER CODE END 0 */
 
 /**
@@ -105,7 +133,27 @@ int main(void)
   MX_TIM2_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+  RingBuffer_Init();
 
+  HAL_GPIO_WritePin(CS_IMU1_GPIO_Port, CS_IMU1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(CS_IMU2_GPIO_Port, CS_IMU2_Pin, GPIO_PIN_RESET);
+  HAL_Delay(10);
+  HAL_GPIO_WritePin(CS_IMU1_GPIO_Port, CS_IMU1_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(CS_IMU2_GPIO_Port, CS_IMU2_Pin, GPIO_PIN_SET);
+  HAL_Delay(10);
+
+  if ((MPU9250_Init(CS_IMU1_GPIO_Port, CS_IMU1_Pin) != HAL_OK) ||
+      (MPU9250_Init(CS_IMU2_GPIO_Port, CS_IMU2_Pin) != HAL_OK))
+  {
+    Error_Handler();
+  }
+
+  if (!SD_Logger_Init())
+  {
+    Error_Handler();
+  }
+
+  Timestamp_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -115,6 +163,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint8_t *full_block = NULL;
+    if (RingBuffer_GetFullBlock(&full_block))
+    {
+      if (!SD_Logger_Write(full_block, BLOCK_SIZE_BYTES))
+      {
+        HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+      }
+      RingBuffer_ReleaseBlock();
+      HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -403,6 +461,52 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if ((GPIO_Pin == INT_IMU1_Pin) && (imu_dma_state == IMU_DMA_IDLE))
+  {
+    imu_timestamp_us = Timestamp_Get();
+    imu_dma_state = IMU_DMA_IMU1;
+    if (MPU9250_ReadSensor_DMA(&imu1, imu1_rx_frame) != HAL_OK)
+    {
+      imu_dma_state = IMU_DMA_IDLE;
+      HAL_GPIO_WritePin(imu1.cs_port, imu1.cs_pin, GPIO_PIN_SET);
+    }
+  }
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  if (hspi->Instance != SPI4)
+  {
+    return;
+  }
+
+  if (imu_dma_state == IMU_DMA_IMU1)
+  {
+    HAL_GPIO_WritePin(imu1.cs_port, imu1.cs_pin, GPIO_PIN_SET);
+    imu_dma_state = IMU_DMA_IMU2;
+    if (MPU9250_ReadSensor_DMA(&imu2, imu2_rx_frame) != HAL_OK)
+    {
+      imu_dma_state = IMU_DMA_IDLE;
+      HAL_GPIO_WritePin(imu2.cs_port, imu2.cs_pin, GPIO_PIN_SET);
+    }
+  }
+  else if (imu_dma_state == IMU_DMA_IMU2)
+  {
+    HAL_GPIO_WritePin(imu2.cs_port, imu2.cs_pin, GPIO_PIN_SET);
+    Record_BuildAndPush();
+    imu_dma_state = IMU_DMA_IDLE;
+  }
+}
+
+void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if ((htim->Instance == TIM2) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3))
+  {
+    __HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_3, __HAL_TIM_GET_COMPARE(htim, TIM_CHANNEL_3) + 1000U);
+  }
+}
 
 /* USER CODE END 4 */
 
